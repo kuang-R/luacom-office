@@ -1,0 +1,705 @@
+--[[
+===============================================================================
+  Excel.lua 测试套件  Test Suite
+===============================================================================
+
+  文件编码:
+    保存为 UTF-8 with BOM 以确保 Windows Lua 正确处理中文
+    WSL2 默认 UTF-8 without BOM — 传到 Windows 前需转码
+
+  输出:
+    控制台 — 简洁的步骤摘要
+    日志文件 (test_log_YYYYMMDD_HHMMSS.txt) — 完整 hex dump 供离线调试
+
+  测试结构:
+    PART 1  ENVIRONMENT     环境快照，采集 OS/Lua/COM/codepage 信息
+    PART 2  UTILITY FUNCTIONS  纯函数单元测试，不需要 Excel
+    PART 3  ENCODING         UTF-8 ↔ GBK 往返转码测试
+    PART 4  EXCEL COM        完整 Excel COM 集成测试
+
+===============================================================================
+]]
+
+local excel = require("excel")
+
+----------------------------------------------------------------------
+--  Logger  --  双路输出: 控制台 (简洁) + 文件 (详细, 含 hex dump)
+----------------------------------------------------------------------
+local Logger = {}
+
+function Logger:new(filepath)
+    local obj = {
+        _fh = nil, _path = filepath,
+        _start = os.time(),
+        _step = 0, _errors = 0, _warns = 0, _skips = 0,
+        _indent = 0,
+    }
+    setmetatable(obj, { __index = Logger })
+    local fh, err = io.open(filepath, "w")
+    if fh then
+        fh:write("\239\187\191")  -- UTF-8 BOM
+        obj._fh = fh
+    end
+    obj:_both(string.rep("=", 60))
+    obj:_both("  Excel.lua Test  --  " .. os.date("%Y-%m-%d %H:%M:%S"))
+    obj:_both(string.rep("=", 60))
+    return obj
+end
+
+-- 内部: 写入文件
+function Logger:_write(s)
+    if self._fh then self._fh:write(s .. "\n"); self._fh:flush() end
+end
+
+-- 内部: 双路 (文件 + 控制台)
+function Logger:_both(s)
+    self:_write(s)
+    print(s)
+end
+
+-- 内部: 仅文件 (不刷屏)
+function Logger:_file(s)
+    self:_write(s)
+end
+
+-- 内部: 缩进
+function Logger:_pad()
+    return string.rep("  ", self._indent)
+end
+
+----------------------------------------------------------------------
+--  Logger API
+----------------------------------------------------------------------
+
+--- 区块标题
+function Logger:section(title)
+    local line = "+" .. string.rep("-", 58) .. "+"
+    self:_both("")
+    self:_both(line)
+    local bare = title:gsub("\27%b[]", "")
+    local pad = #bare < 56 and string.rep(" ", 56 - #bare) or ""
+    self:_both("| " .. title .. pad .. " |")
+    self:_both(line)
+end
+
+--- 测试步骤 (自动编号)
+---@return integer id
+function Logger:step(desc)
+    self._step = self._step + 1
+    local id = self._step
+    self:_both(string.format("  [%2d] %s", id, desc))
+    self._indent = 1
+    return id
+end
+
+--- 步骤通过
+function Logger:pass(id)
+    self:_both(string.format("  [%2d]   => PASS", id))
+    self._indent = 0
+end
+
+--- 步骤失败
+function Logger:fail(id, reason)
+    self._errors = self._errors + 1
+    local s = string.format("  [%2d]   => FAIL", id)
+    if reason then s = s .. "  (" .. reason .. ")" end
+    self:_both(s)
+    self._indent = 0
+end
+
+--- 步骤跳过
+function Logger:skip(id, reason)
+    self._skips = self._skips + 1
+    local s = string.format("  [%2d]   => SKIP", id)
+    if reason then s = s .. "  (" .. reason .. ")" end
+    self:_both(s)
+    self._indent = 0
+end
+
+--- 普通信息 (双路)
+function Logger:info(msg)
+    self:_both("  " .. self:_pad() .. msg)
+end
+
+--- 详细信息 (仅文件)
+function Logger:detail(msg)
+    self:_file("  " .. self:_pad() .. "[*] " .. msg)
+end
+
+--- 警告
+function Logger:warn(msg)
+    self._warns = self._warns + 1
+    self:_both("  " .. self:_pad() .. "[!] " .. msg)
+end
+
+--- 错误 (含堆栈, 双路)
+function Logger:error(msg)
+    self._errors = self._errors + 1
+    self:_both("  " .. self:_pad() .. "[X] ERROR: " .. tostring(msg))
+    local trace = debug.traceback("", 2)
+    if trace and trace ~= "" then
+        self:_file("  " .. self:_pad() .. "    Stack:")
+        for line in trace:gmatch("[^\n]+") do
+            self:_file("  " .. self:_pad() .. "      " .. line)
+        end
+    end
+end
+
+--- 键值对 (仅文件, 对齐)
+function Logger:data(key, value)
+    local v
+    if type(value) == "boolean" then
+        v = value and "true" or "false"
+    elseif type(value) == "table" then
+        local p = {}
+        for k, val in pairs(value) do table.insert(p, tostring(k) .. "=" .. tostring(val)) end
+        v = "{" .. table.concat(p, ", ") .. "}"
+    elseif value == nil then
+        v = "(nil)"
+    else
+        v = tostring(value)
+    end
+    v = v:gsub("\r\n", " "):gsub("\n", " "):gsub("\r", " "):gsub("%s+", " ")
+    local pad = key .. string.rep(" ", math.max(0, 28 - #key))
+    self:_file(string.format("        %s = %s", pad, v))
+end
+
+--- 字节 hex dump (仅文件)
+function Logger:bytes(label, s)
+    if s == nil then
+        self:_file("        " .. label .. "  =>  (nil)")
+        return
+    end
+    local hex = {}
+    for i = 1, #s do hex[i] = string.format("%02X", string.byte(s, i)) end
+    local ascii = s:gsub("[^\032-\126]", ".")
+    self:_file(string.format("        %-26s  len=%-4d  hex= %s", label, #s, table.concat(hex, " ")))
+    self:_file(string.format("        %-26s  str= \"%s\"", "", ascii))
+end
+
+--- 单条断言记录 (仅文件)
+function Logger:assertion(name, ok, expected, got)
+    if ok then
+        self:_file(string.format("        [v] %s  =>  %s", name, tostring(expected)))
+    else
+        self:_file(string.format("        [x] %s  expected=%s  got=%s", name, tostring(expected), tostring(got)))
+    end
+end
+
+function Logger:separator()
+    self:_both("  " .. string.rep("~", 56))
+end
+
+function Logger:summary()
+    local elapsed = os.time() - self._start
+    local passed = self._step - self._errors - self._skips
+    self:_both("")
+    self:_both(string.rep("=", 60))
+    self:_both("  SUMMARY")
+    self:_both(string.rep("-", 60))
+    self:_both(string.format("  Steps   : %d", self._step))
+    self:_both(string.format("  Passed  : %d", passed))
+    self:_both(string.format("  Failed  : %d", self._errors))
+    self:_both(string.format("  Skipped : %d", self._skips))
+    self:_both(string.format("  Warnings: %d", self._warns))
+    self:_both(string.format("  Time    : %ds", elapsed))
+    self:_both(string.rep("-", 60))
+    if self._errors == 0 then
+        self:_both("  RESULT: ALL PASSED")
+    else
+        self:_both(string.format("  RESULT: %d ERROR(S) -- check details above", self._errors))
+    end
+    self:_both(string.rep("=", 60))
+    self:_both("  Log file: " .. self._path)
+end
+
+function Logger:close()
+    if self._fh then self._fh:close(); self._fh = nil end
+end
+
+----------------------------------------------------------------------
+--  Encoding  --  UTF-8 <-> 系统 ANSI (GBK/CP936) 转码
+--
+--  为什么需要:
+--    Windows 中文系统 (CP936/GBK) 上，Lua 字符串字面量若源文件为 UTF-8，
+--    其字节也是 UTF-8。但 LuaCOM 传给 Excel 时，Excel 期望系统 ANSI 编码。
+--    因此需将 UTF-8 字符串转为 GBK 再写入 Excel。
+--
+--  工作原理:
+--    将待转码字符串写入临时文件 → powershell 读取并重编码 → 读回结果
+----------------------------------------------------------------------
+local encoding = { _log = nil }
+
+function encoding.isWindows()
+    return package.config:sub(1, 1) == "\\"
+end
+
+function encoding.getACP()
+    if not encoding.isWindows() then return nil end
+    local h = io.popen("chcp 2>nul", "r")
+    if not h then return nil end
+    local r = h:read("*a")
+    h:close()
+    local acp = r:match("(%d+)")
+    local num = acp and tonumber(acp) or nil
+    if encoding._log and num then encoding._log:data("ACP codepage", num) end
+    return num
+end
+
+function encoding.toACP(utf8_str)
+    if not encoding.isWindows() then return utf8_str end
+    if encoding._log then encoding._log:bytes("toACP input", utf8_str) end
+    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
+    local f = io.open(tmp_in, "wb")
+    if not f then return nil, "cannot create temp file" end
+    f:write(utf8_str)
+    f:close()
+    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::UTF8), [System.Text.Encoding]::Default)" 2>&1]]
+    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
+    local h = io.popen(cmd, "r")
+    if not h then os.remove(tmp_in); return nil, "popen failed" end
+    local stderr_out = h:read("*a")
+    h:close()
+    local f2 = io.open(tmp_out, "rb")
+    if not f2 then
+        if encoding._log then encoding._log:detail("toACP stderr: " .. (stderr_out:gsub("%s+", " ") or "(none)")) end
+        os.remove(tmp_in); return nil, "no output"
+    end
+    local result = f2:read("*a")
+    f2:close()
+    os.remove(tmp_in); os.remove(tmp_out)
+    if #result == 0 and #utf8_str > 0 then
+        if encoding._log then encoding._log:detail("toACP empty; stderr: " .. stderr_out:gsub("%s+", " ")) end
+        return nil, "empty output"
+    end
+    if encoding._log then encoding._log:bytes("toACP output", result) end
+    return result
+end
+
+function encoding.toUTF8(ansi_str)
+    if not encoding.isWindows() then return ansi_str end
+    if encoding._log then encoding._log:bytes("toUTF8 input", ansi_str) end
+    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
+    local f = io.open(tmp_in, "wb")
+    if not f then return nil end
+    f:write(ansi_str)
+    f:close()
+    -- UTF8Encoding($false) = 不带 BOM
+    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $enc=New-Object System.Text.UTF8Encoding $false; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::Default), $enc)" 2>&1]]
+    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
+    local h = io.popen(cmd, "r")
+    if not h then os.remove(tmp_in); return nil end
+    local stderr_out = h:read("*a")
+    h:close()
+    local f2 = io.open(tmp_out, "rb")
+    if not f2 then
+        if encoding._log then encoding._log:detail("toUTF8 stderr: " .. stderr_out:gsub("%s+", " ")) end
+        os.remove(tmp_in); return nil
+    end
+    local result = f2:read("*a")
+    f2:close()
+    os.remove(tmp_in); os.remove(tmp_out)
+    if encoding._log then encoding._log:bytes("toUTF8 output", result) end
+    return result
+end
+
+--- 为写入 Excel 准备字符串: 中文系统上 UTF-8 → GBK, 其他环境原样返回
+function encoding.forExcel(str)
+    if encoding._log then encoding._log:bytes("forExcel input", str) end
+    if encoding.isWindows() then
+        local acp = encoding.getACP()
+        if acp == 936 or acp == 950 or acp == 54936 then
+            local converted, err = encoding.toACP(str)
+            if converted then
+                if encoding._log then encoding._log:detail("forExcel: UTF8->ACP(" .. acp .. ")") end
+                return converted
+            elseif encoding._log then
+                encoding._log:warn("forExcel conversion failed: " .. (err or "?"))
+            end
+        end
+    end
+    if encoding._log then encoding._log:detail("forExcel: passthrough") end
+    return str
+end
+
+-- ============================================================================
+--  PART 1  环境快照  ENVIRONMENT
+-- ============================================================================
+--  采集运行环境的全部关键信息，便于离线诊断兼容性问题。
+--  包括: OS, Lua 版本, 系统版本, ANSI 代码页, luacom 状态, 模块导出列表,
+--        以及源码中文字面量在内存中的实际字节 (用于判断源文件编码是否正确)。
+-- ============================================================================
+local function part1_environment(log)
+    local id = log:step("Environment")
+
+    local is_win = encoding.isWindows()
+    log:data("OS",                     is_win and "Windows" or "Linux/WSL")
+    log:data("Lua version",            _VERSION)
+
+    -- 系统版本 (Windows: powershell 避免 GBK 乱码)
+    if is_win then
+        local h = io.popen([[powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).Caption + ' [' + (Get-CimInstance Win32_OperatingSystem).Version + ']'"]], "r")
+        if h then
+            local info = h:read("*a"):gsub("\r\n", ""):gsub("\n", ""):gsub("\r", ""):gsub("%s+", " ")
+            h:close()
+            log:data("System", info)
+        end
+    else
+        local h = io.popen("uname -a 2>/dev/null", "r")
+        if h then
+            local info = h:read("*a"):gsub("\r\n", " "):gsub("\n", " "):gsub("%s+", " ")
+            h:close()
+            log:data("System", info)
+        end
+    end
+
+    -- ANSI 代码页 (936=GBK, 950=BIG5, 54936=GB18030)
+    local acp = encoding.getACP()
+    if acp then
+        local label = "ANSI codepage"
+        if acp == 936      then label = label .. " (GBK)"
+        elseif acp == 950  then label = label .. " (BIG5)"
+        elseif acp == 54936 then label = label .. " (GB18030)" end
+        log:data(label, acp)
+    end
+
+    -- luacom 模块状态
+    local ok, err = pcall(require, "luacom")
+    log:data("luacom", ok and "available" or ("MISSING: " .. tostring(err):gsub("\n", " ")))
+
+    -- excel 模块导出的字段
+    local fields = {}
+    for k, v in pairs(excel) do
+        table.insert(fields, k .. "(" .. type(v) .. ")")
+    end
+    table.sort(fields)
+    log:data("excel exports", table.concat(fields, ", "))
+
+    -- 源码中文字面量 "测试" 的实际字节: 应为 E6 B5 8B E8 AF 95 (UTF-8 正确)
+    -- 若显示其他值, 说明源文件被错误地按其他编码保存或解析
+    local literal = "\230\181\139\232\175\149"
+    log:bytes('\230\181\139\232\175\149 ("\229\181\139\229\143\175\229\140\150")', literal)
+
+    log:pass(id)
+end
+
+-- ============================================================================
+--  PART 2  工具函数  UTILITY FUNCTIONS
+-- ============================================================================
+--  纯函数单元测试，验证列号/字母转换, 单元格/区域地址生成。
+--  不依赖 Excel COM, 任何环境均可运行。
+--
+--  columnLetter(n)  数字列号 → 字母: 1=A, 27=AA, 702=ZZ
+--  columnNumber(s)  字母 → 数字: A=1, AA=27
+--  cellAddr(r,c)    行列号 → "A1" 格式
+--  rangeAddr(...)   行列号 → "A1:C10" 格式
+-- ============================================================================
+local function part2_utils(log)
+    local id = log:step("Utility functions (14 assertions)")
+
+    local cases = {
+        -- 列号 → 字母 (6 项)
+        { "columnLetter(1)",    excel.columnLetter(1),     "A" },
+        { "columnLetter(26)",   excel.columnLetter(26),    "Z" },
+        { "columnLetter(27)",   excel.columnLetter(27),    "AA" },
+        { "columnLetter(52)",   excel.columnLetter(52),    "AZ" },
+        { "columnLetter(53)",   excel.columnLetter(53),    "BA" },
+        { "columnLetter(702)",  excel.columnLetter(702),   "ZZ" },
+        -- 字母 → 列号 (5 项)
+        { "columnNumber('A')",  excel.columnNumber("A"),   1 },
+        { "columnNumber('Z')",  excel.columnNumber("Z"),   26 },
+        { "columnNumber('AA')", excel.columnNumber("AA"),  27 },
+        { "columnNumber('AZ')", excel.columnNumber("AZ"),  52 },
+        { "columnNumber('BA')", excel.columnNumber("BA"),  53 },
+        -- 地址生成 (3 项)
+        { "cellAddr(1,1)",      excel.cellAddr(1, 1),     "A1" },
+        { "cellAddr(10,27)",    excel.cellAddr(10, 27),   "AA10" },
+        { "rangeAddr(1,1,10,3)",excel.rangeAddr(1,1,10,3),"A1:C10" },
+    }
+
+    local nfail = 0
+    for _, tc in ipairs(cases) do
+        local ok = (tc[2] == tc[3])
+        log:assertion(tc[1], ok, tc[3], tc[2])
+        if not ok then nfail = nfail + 1 end
+    end
+    if nfail == 0 then log:pass(id) else log:fail(id, nfail .. " failed") end
+end
+
+-- ============================================================================
+--  PART 3  编码往返  ENCODING
+-- ============================================================================
+--  验证 encoding.toACP / encoding.toUTF8 的正确性。
+--  取 UTF-8 字符串 "测试" (E6 B5 8B E8 AF 95), 转为系统 ANSI (B2 E2 CA D4),
+--  再转回 UTF-8。两次转换后字节必须与原始完全一致。
+--  仅在 Windows 上运行 (需要 powershell)。
+-- ============================================================================
+local function part3_encoding(log)
+    local id = log:step("Encoding roundtrip (UTF-8 -> ACP -> UTF-8)")
+    if not encoding.isWindows() then
+        log:skip(id, "not Windows")
+        return
+    end
+
+    local original = "\230\181\139\232\175\149"  -- UTF-8 "测试" = E6 B5 8B E8 AF 95
+    local ansi = encoding.toACP(original)         -- → GBK "测试" = B2 E2 CA D4
+    if not ansi then
+        log:fail(id, "toACP returned nil")
+        return
+    end
+
+    local utf8 = encoding.toUTF8(ansi)             -- → UTF-8 (应等于 original)
+    if not utf8 then
+        log:fail(id, "toUTF8 returned nil")
+        return
+    end
+
+    if utf8 == original then
+        log:pass(id)
+    else
+        log:fail(id, "roundtrip mismatch (check bytes in log)")
+        log:bytes("expected", original)
+        log:bytes("got     ", utf8)
+    end
+end
+
+-- ============================================================================
+--  PART 4  Excel COM 集成测试  EXCEL COM
+-- ============================================================================
+--  完整的 Excel COM 操作链, 覆盖库的全部核心功能。
+--  每个步骤 (4..14) 验证一类操作, 步骤间有依赖 (前一步必须成功后续才有意义)。
+--  所有中文字符串经由 encoding.forExcel() 转码后再写入 Excel。
+--
+--  步骤:
+--    [4]  检测 COM 环境 (Windows + luacom 已安装)
+--    [5]  创建不可见的 Excel.Application 实例
+--    [6]  新建空白工作簿
+--    [7]  工作表改中文名 (验证 encoding.forExcel 写入正确)
+--    [8]  写入 string/number/boolean/formula 并读回断言
+--    [9]  写入中文表头+3行数据, 读回验证编码往返
+--    [10] Range 格式化: 字体, 颜色, 边框, 自动列宽
+--    [11] 合并单元格 + 居中标题
+--    [12] 数字格式: 小数 #,##0.00 + 日期 yyyy-mm-dd
+--    [13] 工作表增删: 新建 → 断言总数=2 → 删除 → 断言总数=1
+--    [14] 读取 Excel 版本号
+-- ============================================================================
+local function part4_excel(log)
+
+    -- [4] 检测 COM 环境
+    --     非 Windows → 直接跳过全部 COM 测试
+    --     luacom 未安装 → 标记失败并退出
+    local id = log:step("Check COM environment")
+    if not encoding.isWindows() then
+        log:skip(id, "not Windows -- WSL/Linux has no COM")
+        log:section("Excel COM tests skipped (non-Windows)")
+        return false
+    end
+    local luacom_ok, luacom_err = pcall(require, "luacom")
+    if not luacom_ok then
+        log:fail(id, "luacom not available: " .. tostring(luacom_err):gsub("\n", " | "))
+        return false
+    end
+    log:pass(id)
+
+    -- [5] 创建 Excel.Application (不可见模式)
+    --     DisplayAlerts=false: 不弹警告框
+    --     ScreenUpdating=false: 默认不刷新 (库行为)
+    id = log:step("Create Excel.Application")
+    local app, app_err = excel.ExcelApp:new(false)
+    if not app then
+        log:fail(id, app_err or "ExcelApp:new() returned nil")
+        return false
+    end
+    log:pass(id)
+
+    local all_ok = true
+    local worked, run_err = pcall(function()
+        app:displayAlerts(false)
+
+        -- [6] 新建工作簿
+        --     默认包含一个工作表 (Sheet1), 名称由 Excel 本地化决定
+        id = log:step("Add workbook")
+        local wb = app:addWorkbook()
+        log:data("name", wb:name())
+        log:pass(id)
+
+        -- [7] 工作表改中文名
+        --     中文名 "测试表" 经 encoding.forExcel() UTF-8→GBK 后写入
+        --     读回名称与写入值逐字节比对, 确保编码无误
+        id = log:step("Rename sheet with Chinese name")
+        local s1 = wb:sheetByIndex(1)
+        local cn = encoding.forExcel("\230\181\139\232\175\149\232\161\168")  -- "测试表"
+        s1:setName(cn)
+        local got = wb:sheet(cn):name()
+        log:data("expected", cn)
+        log:bytes("got bytes", got)
+        if got == cn then
+            log:pass(id)
+        else
+            log:fail(id, "name mismatch -- possible encoding issue")
+            all_ok = false
+        end
+
+        -- [8] 基本类型读写
+        --     验证 string, integer, float, boolean, formula 写入后读回一致
+        --     A1="Hello", B1=12345, C1=3.14159, D1=true, E1==A1 & " World"
+        id = log:step("Read/write basic types (string, number, boolean, formula)")
+        s1:cell(1, 1, "Hello")
+        s1:cell(1, 2, 12345)
+        s1:cell(1, 3, 3.14159)
+        s1:cell(1, 4, true)
+        s1:cell(1, 5, "=A1 & \" World\"")
+        log:assertion("A1 string", s1:cell(1,1) == "Hello", "Hello", s1:cell(1,1))
+        log:assertion("B1 number", s1:cell(1,2) == 12345,   12345,   s1:cell(1,2))
+        log:pass(id)
+
+        -- [9] 中文数据写入并读回 (编码往返验证)
+        --     表头: 姓名, 年龄, 城市 → 经 encoding.forExcel 转 GBK 写入
+        --     数据: 张三/25/北京, 李四/30/上海, 王五/28/广州
+        --     读回 "张三" → encoding.toUTF8 转回 UTF-8 → 验证与原始字节一致
+        id = log:step("Write/read Chinese characters")
+
+        -- 表头 (行3)
+        local header = {
+            encoding.forExcel("\229\167\147\229\144\141"),   -- "姓名"
+            encoding.forExcel("\229\185\180\233\190\132"),   -- "年龄"
+            encoding.forExcel("\229\159\142\229\184\130"),   -- "城市"
+        }
+        for c, v in ipairs(header) do
+            s1:cell(3, c, v)
+            log:bytes("header[" .. c .. "]", v)
+        end
+
+        -- 数据 (行4-6)
+        local rows = {
+            { "\229\188\160\228\184\137", 25, "\229\140\151\228\186\172" },  -- 张三,25,北京
+            { "\230\157\142\229\155\155", 30, "\228\184\138\230\181\183" },  -- 李四,30,上海
+            { "\231\142\139\228\186\148", 28, "\229\185\191\229\183\158" },  -- 王五,28,广州
+        }
+        for r, row in ipairs(rows) do
+            local name = encoding.forExcel(row[1])
+            local city = encoding.forExcel(row[3])
+            s1:cell(3 + r, 1, name)
+            s1:cell(3 + r, 2, row[2])
+            s1:cell(3 + r, 3, city)
+            log:bytes("row" .. r .. " name", name)
+            log:bytes("row" .. r .. " city", city)
+        end
+
+        -- 读回 "张三" (行4列1), 验证 GBK → UTF-8 往返
+        local rb = s1:cell(4, 1)
+        log:data("readback type", type(rb))
+        log:bytes("readback raw", tostring(rb or ""))
+        local rb_utf8 = encoding.toUTF8(rb or "")
+        if rb_utf8 then
+            log:bytes("readback UTF8", rb_utf8)
+        end
+        log:pass(id)
+
+        -- [10] Range 格式化
+        --      表头行 (A3:C3): 粗体, 12pt, 居中, 蓝底白字, 外边框
+        --      数据区 (A4:C6): 全部框线
+        --      整体 (A1:E6): 自动列宽
+        id = log:step("Range formatting (font, color, border, autofit)")
+        local rng = s1:range("A3:C3")
+        rng:bold(true):fontSize(12):halign("Center")
+        rng:bgColor(0x4472C4):fontColor(0xFFFFFF)
+        rng:borderOutline("Continuous")
+        s1:range("A4:C6"):borderAll("Continuous")
+        s1:range("A1:E6"):autoFit()
+        log:data("header range", rng:address())
+        log:pass(id)
+
+        -- [11] 合并单元格
+        --      A8:C8 合并, 写入 "合并标题" 居中加粗
+        id = log:step("Merge cells")
+        s1:range("A8:C8"):merge()
+        s1:cell(8, 1, encoding.forExcel("\229\144\136\229\185\182\230\160\135\233\162\152"))  -- "合并标题"
+        s1:range("A8:C8"):halign("Center"):bold(true)
+        log:pass(id)
+
+        -- [12] 数字格式
+        --      A10: 45678.9012 → 格式 "#,##0.00" (千分位两位小数)
+        --      B10: os.date("*t") → 自动转为 Excel 日期序列号 → 格式 "yyyy-mm-dd"
+        id = log:step("Number format (decimal, date)")
+        s1:range("A10"):value(45678.9012)
+        s1:range("A10"):numberFormat("#,##0.00")
+        s1:range("B10"):value(os.date("*t"))          -- table → ExcelApp.dateSerial()
+        s1:range("B10"):numberFormat("yyyy-mm-dd")
+        log:pass(id)
+
+        -- [13] 工作表增删
+        --      在 s1 之后新建 "第二表" (中文名转码) → 断言总数=2
+        --      写入测试数据后删除 → 断言总数=1
+        id = log:step("Add & delete worksheet")
+        local s2 = wb:addSheet(encoding.forExcel("\231\172\172\228\186\140\232\161\168"), s1)  -- "第二表"
+        log:data("count after add", wb:sheetCount())
+        if wb:sheetCount() ~= 2 then
+            log:fail(id, "expected 2 sheets, got " .. wb:sheetCount())
+            all_ok = false
+        else
+            s2:cell(1, 1, "tmp")
+            wb:deleteSheet(s2:name())
+            log:data("count after delete", wb:sheetCount())
+            if wb:sheetCount() ~= 1 then
+                log:fail(id, "expected 1 sheet after delete, got " .. wb:sheetCount())
+                all_ok = false
+            else
+                log:pass(id)
+            end
+        end
+
+        -- [14] Excel 版本
+        --      预期 16.0 = Office 2016/2019/365
+        id = log:step("Excel version")
+        log:data("version", app:version())
+        log:pass(id)
+    end)
+
+    -- 清理: 丢弃所有更改, 静默退出 Excel
+    pcall(function()
+        app:displayAlerts(false)
+        app:quit()   -- quit() 内部会先关闭所有工作簿再 Quit(), 不弹保存对话框
+    end)
+
+    if not worked then
+        log:error(run_err)
+        all_ok = false
+    end
+    return all_ok
+end
+
+-- ============================================================================
+--  入口  MAIN
+-- ============================================================================
+
+local logfile = string.format("test_log_%s.txt", os.date("%Y%m%d_%H%M%S"))
+local log = Logger:new(logfile)
+
+-- PART 1: 环境
+log:section("ENVIRONMENT")
+local ok1, e1 = pcall(part1_environment, log)
+if not ok1 then log:error("PART1 crashed: " .. tostring(e1)) end
+
+-- PART 2: 工具函数
+log:section("UTILITY FUNCTIONS")
+local ok2, e2 = pcall(part2_utils, log)
+if not ok2 then log:error("PART2 crashed: " .. tostring(e2)) end
+
+-- PART 3: 编码
+log:section("ENCODING")
+encoding._log = log
+local ok3, e3 = pcall(part3_encoding, log)
+if not ok3 then log:error("PART3 crashed: " .. tostring(e3)) end
+
+-- PART 4: Excel COM
+log:section("EXCEL COM")
+local ok4, e4 = pcall(part4_excel, log)
+if not ok4 then log:error("PART4 crashed: " .. tostring(e4)) end
+
+-- 摘要
+log:summary()
+log:close()
+
+print("")
+print("  Log saved to: " .. logfile)
