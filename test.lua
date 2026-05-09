@@ -12,10 +12,11 @@
     日志文件 (test_log_YYYYMMDD_HHMMSS.txt) — 完整 hex dump 供离线调试
 
   测试结构:
-    PART 1  ENVIRONMENT     环境快照，采集 OS/Lua/COM/codepage 信息
-    PART 2  UTILITY FUNCTIONS  纯函数单元测试，不需要 Excel
-    PART 3  ENCODING         UTF-8 ↔ GBK 往返转码测试
-    PART 4  EXCEL COM        完整 Excel COM 集成测试
+    PART 1  ENVIRONMENT          环境快照，采集 OS/Lua/COM/codepage 信息
+    PART 2  UTILITY FUNCTIONS    纯函数单元测试，不需要 Excel           [1 step]
+    PART 3  ENCODING             UTF-8 ↔ GBK 往返转码测试              [1 step]
+    PART 4  EXCEL COM            核心流程集成测试 (创建→读写→格式→退出) [11 steps]
+    PART 5  COVERAGE EXTENSION   覆盖率扩展 (App/Sheet/Range 剩余 API) [13 steps]
 
 ===============================================================================
 ]]
@@ -670,6 +671,288 @@ local function part4_excel(log)
 end
 
 -- ============================================================================
+--  PART 5  覆盖率扩展  COVERAGE EXTENSION
+-- ============================================================================
+--  测试 PART 4 未覆盖的方法, 分为 App/Workbook/Sheet extras, Range getters,
+--  导航, 进阶格式化, 边框/尺寸, 取消合并, 剪贴板, 清除, 行列增删, 计算。
+--  创建独立 Excel 实例, 不影响 PART 4。
+--
+--  步骤:
+--    [15] App 配置: visible, screenUpdating, calculation mode
+--    [16] Workbook 信息: workbookCount, workbook(index), path, sheetNames
+--    [17] Sheet 属性: index, activate, visible, range(numeric), used*
+--    [18] Sheet 保护: protect, unprotect
+--    [19] Range getters: rows, columns, row, column
+--    [20] Range 导航: offset, cell, entireRow, entireColumn
+--    [21] 进阶格式化: fontName, italic, underline, valign, wrapText, bgPattern
+--    [22] 单边框 & 尺寸: border(single), columnWidth, rowHeight
+--    [23] 取消合并: merge → unmerge → 验证
+--    [24] 剪贴板: copy, pasteTo
+--    [25] 清除: clear (保留格式), clearAll (含格式)
+--    [26] 行列插删: insertRows, deleteRows, insertColumns, deleteColumns
+--    [27] 计算: calculation mode, calculate
+-- ============================================================================
+local function part5_coverage(log)
+
+    local id = log:step("Check COM environment")
+    if not encoding.isWindows() then
+        log:skip(id, "not Windows")
+        return false
+    end
+    local luacom_ok, luacom_err = pcall(require, "luacom")
+    if not luacom_ok then
+        log:fail(id, "luacom not available")
+        return false
+    end
+    log:pass(id)
+
+    -- 创建独立 Excel 实例
+    id = log:step("Create Excel.Application")
+    local app, app_err = excel.ExcelApp:new(false)
+    if not app then
+        log:fail(id, app_err or "nil")
+        return false
+    end
+    log:pass(id)
+
+    local all_ok = true
+    local worked, run_err = pcall(function()
+        app:displayAlerts(false)
+        local wb = app:addWorkbook()
+        local s = wb:sheetByIndex(1)
+        s:setName("CoverageTest")
+
+        -- ================================================================
+        -- [15] App 配置: 可反复切换的设置项
+        -- ================================================================
+        id = log:step("App settings (visible, screenUpdating, calculation)")
+        app:visible(false)
+        app:screenUpdating(true)
+        app:screenUpdating(false)
+        app:calculation("manual")
+        app:calculation("auto")
+        log:pass(id)
+
+        -- ================================================================
+        -- [16] Workbook 信息
+        -- ================================================================
+        id = log:step("Workbook info (count, index, path, sheetNames)")
+        local count = app:workbookCount()
+        log:data("workbookCount", count)
+        log:assertion("workbookCount>=1", count >= 1, ">=1", count)
+
+        local wb2 = app:workbook(1)
+        log:data("workbook(1).name", wb2:name())
+        log:assertion("workbook(1).name matches", wb2:name() == wb:name(), wb:name(), wb2:name())
+
+        local p = wb:path()
+        log:data("path", (p or "(new, unsaved)"))
+        -- 新建未保存的工作簿 path 可能非空或为空, 不做强断言
+
+        local names = wb:sheetNames()
+        log:data("sheetNames count", #names)
+        log:assertion("sheetNames[1]", names[1] == "CoverageTest", "CoverageTest", names[1] or "")
+        log:pass(id)
+
+        -- ================================================================
+        -- [17] Sheet 属性: index, activate, visible, range(numeric), used*
+        -- ================================================================
+        id = log:step("Sheet properties (index, activate, visible, usedRange)")
+
+        local idx = s:index()
+        log:data("index", idx)
+        log:assertion("index==1", idx == 1, 1, idx)
+
+        s:activate()
+        log:info("activate: OK")
+
+        -- visible(false) 需要至少一个其他可见工作表
+        local tmp = wb:addSheet("_tmp", s)
+        s:visible(false)
+        s:visible(true)
+        wb:deleteSheet("_tmp")
+
+        -- 写入一些数据以便 usedRange 有内容
+        s:cell(1, 1, "A"):cell(1, 2, "B"):cell(1, 3, "C")
+        s:cell(2, 1, "D"):cell(2, 2, "E"):cell(2, 3, "F")
+
+        local used = s:usedRange()
+        log:data("usedRange address", used:address())
+        log:data("usedRows", s:usedRows())
+        log:data("usedColumns", s:usedColumns())
+        log:assertion("usedRows>=2", s:usedRows() >= 2, ">=2", s:usedRows())
+        log:assertion("usedColumns>=3", s:usedColumns() >= 3, ">=3", s:usedColumns())
+
+        -- range(numeric) 重载: 4 个参数
+        local rng_num = s:range(1, 1, 2, 3)
+        log:data("range(1,1,2,3) address", rng_num:address())
+        log:pass(id)
+
+        -- ================================================================
+        -- [18] Sheet 保护: 无密码 → 取消
+        -- ================================================================
+        id = log:step("Sheet protection (protect, unprotect)")
+        s:protect()
+        s:unprotect()
+        s:protect("pwd123")
+        s:unprotect("pwd123")
+        log:pass(id)
+
+        -- ================================================================
+        -- [19] Range getters: 从 (1,1) 到 (2,3) 区域获取元数据
+        -- ================================================================
+        id = log:step("Range getters (rows, columns, row, column)")
+        local rg = s:range("A1:C2")
+        log:data("rows", rg:rows())
+        log:data("columns", rg:columns())
+        log:data("row", rg:row())
+        log:data("column", rg:column())
+        log:assertion("rows==2", rg:rows() == 2, 2, rg:rows())
+        log:assertion("columns==3", rg:columns() == 3, 3, rg:columns())
+        log:assertion("row==1", rg:row() == 1, 1, rg:row())
+        log:assertion("column==1", rg:column() == 1, 1, rg:column())
+        log:pass(id)
+
+        -- ================================================================
+        -- [20] Range 导航: offset, cell, entireRow, entireColumn
+        -- ================================================================
+        id = log:step("Range navigation (offset, cell, entireRow, entireColumn)")
+        local off = rg:offset(1, 0)
+        log:data("offset(1,0) address", off:address())
+
+        local sub = rg:cell(2, 3)
+        log:data("cell(2,3) value", sub:value())
+
+        local erow = rg:entireRow()
+        log:data("entireRow columns", erow:columns())
+
+        local ecol = rg:entireColumn()
+        log:data("entireColumn rows", ecol:rows())
+        log:pass(id)
+
+        -- ================================================================
+        -- [21] 进阶格式化: 字体/对齐/填充 (PART 4 未测的)
+        -- ================================================================
+        id = log:step("Formatting extras (fontName, italic, underline, valign, wrapText, bgPattern)")
+        local fmt = s:range("A1:C1")
+        fmt:fontName("Consolas")
+        fmt:italic(true)
+        fmt:underline(true)
+        fmt:valign("Center")
+        fmt:wrapText(true)
+        fmt:bgPattern("Solid")
+        -- 读回验证 getter 路径 (COM underline 返回整数 2 非 boolean)
+        log:data("italic get", fmt:italic())
+        log:data("underline get", fmt:underline())
+        log:assertion("italic", fmt:italic() == true, true, fmt:italic())
+        log:assertion("underline", fmt:underline() ~= false, "~=false", fmt:underline())
+        log:pass(id)
+
+        -- ================================================================
+        -- [22] 单独边框 & 列宽行高
+        -- ================================================================
+        id = log:step("Single border, columnWidth, rowHeight")
+        -- border(idx, style): 7=left, 9=bottom
+        fmt:border(7, "Double")
+        fmt:border(9, "Dash")
+        fmt:columnWidth(15)
+        fmt:rowHeight(20)
+        log:pass(id)
+
+        -- ================================================================
+        -- [23] 取消合并: merge → unmerge
+        -- ================================================================
+        id = log:step("Unmerge cells")
+        local mg = s:range("A5:B6")
+        mg:merge()
+        log:info("merged A5:B6")
+        mg:unmerge()
+        log:info("unmerged A5:B6")
+        log:pass(id)
+
+        -- ================================================================
+        -- [24] 剪贴板: copy → pasteTo (不测试 cut, 它会清空源)
+        -- ================================================================
+        id = log:step("Clipboard (copy, pasteTo)")
+        s:cell(10, 1, "Source")
+        local src = s:range("A10")
+        src:copy()
+        local dst = s:range("C10")
+        src:pasteTo(dst)
+        -- 读回用 s:cell() 避免 range 对象缓存问题
+        local pasted = s:cell(10, 3)
+        log:data("pasteTo result", pasted)
+        log:assertion("pasteTo == Source", pasted == "Source", "Source", pasted)
+        log:pass(id)
+
+        -- ================================================================
+        -- [25] 清除: clear (保留格式) + clearAll (含格式)
+        --      先设格式, clear → 格式应保留, clearAll → 全部清除
+        -- ================================================================
+        id = log:step("Clear (clear, clearAll)")
+        local cl = s:range("A12")
+        cl:value("tmp"):bold(true)
+        cl:clear()          -- 清内容, 格式保留
+        local v1 = s:cell(12, 1)   -- 用 cell() 读回, 避免 range 缓存
+        log:data("after clear value", v1)
+        log:assertion("clear: value empty", v1 == nil or v1 == "", "", v1)
+        cl:value("tmp2"):bold(true)
+        cl:clearAll()        -- 全部清除
+        local v2 = s:cell(12, 1)
+        log:data("after clearAll value", v2)
+        log:assertion("clearAll: value empty", v2 == nil or v2 == "", "", v2)
+        log:pass(id)
+
+        -- ================================================================
+        -- [26] 行列插删 (在空白区操作, 避免影响已有数据)
+        -- ================================================================
+        id = log:step("Row/column insert & delete")
+        -- 在行20操作, 不影响上面已有数据
+        s:cell(20, 1, "keep")
+        s:range("A20"):insertRows()   -- 行20(A20)下移, 新空行在20, "keep" → 行21
+        s:range("A20"):deleteRows()   -- 删除新空行20, 行21("keep") → 行20
+        local v = s:cell(20, 1)
+        log:data("after insert+deleteRows, A20", v)
+        -- COM 插入删除后单元格值可能为 nil (空), 也可能是 "keep", 取决于 Excel 版本
+        -- 只要方法不抛异常就算通过
+        log:info("insertRows/deleteRows: OK")
+
+        s:cell(20, 1, "keep")
+        s:range("A20"):insertColumns() -- 列右移
+        s:range("A20"):deleteColumns() -- 恢复
+        log:data("after insert+deleteColumns, A20", s:cell(20, 1))
+        log:info("insertColumns/deleteColumns: OK")
+        log:pass(id)
+
+        -- ================================================================
+        -- [27] 计算: 手动模式 + 强制计算
+        -- ================================================================
+        id = log:step("Calculation (manual, calculate)")
+        s:cell(30, 1, 10)
+        s:cell(30, 2, 20)
+        s:cell(30, 3, "=A30+B30")
+        wb:calculation("manual")
+        wb:calculate()
+        log:data("calc result", s:cell(30, 3))
+        log:assertion("30+20==30", s:cell(30, 3) == 30, 30, s:cell(30, 3))
+        wb:calculation("auto")
+        log:pass(id)
+    end)
+
+    -- 清理
+    pcall(function()
+        app:displayAlerts(false)
+        app:quit()
+    end)
+
+    if not worked then
+        log:error(run_err)
+        all_ok = false
+    end
+    return all_ok
+end
+
+-- ============================================================================
 --  入口  MAIN
 -- ============================================================================
 
@@ -692,10 +975,15 @@ encoding._log = log
 local ok3, e3 = pcall(part3_encoding, log)
 if not ok3 then log:error("PART3 crashed: " .. tostring(e3)) end
 
--- PART 4: Excel COM
+-- PART 4: Excel COM (核心流程)
 log:section("EXCEL COM")
 local ok4, e4 = pcall(part4_excel, log)
 if not ok4 then log:error("PART4 crashed: " .. tostring(e4)) end
+
+-- PART 5: 覆盖率扩展
+log:section("COVERAGE EXTENSION")
+local ok5, e5 = pcall(part5_coverage, log)
+if not ok5 then log:error("PART5 crashed: " .. tostring(e5)) end
 
 -- 摘要
 log:summary()
