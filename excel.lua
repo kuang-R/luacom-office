@@ -905,7 +905,13 @@ function ExcelRange:deleteColumns()  self._com.EntireColumn:Delete(); end
 -- ============================================================================
 --  在中文 Windows (CP936) 上，LuaCOM 需要 ANSI/GBK 编码的字符串才能
 --  正确写入 Excel。若源文件为 UTF-8 without BOM，中文会出现乱码。
---  本模块通过 powershell 实现可靠转码。
+--  本模块通过 ADODB.Stream COM 接口实现编码转换，无需 powershell 或临时文件。
+--
+--  原理:
+--    1. 将 UTF-8 字节写入 ADODB.Stream (binary 模式, 避免 LuaCOM 的 BSTR 转换)
+--    2. 以 UTF-8 charset 读取为 Unicode 文本
+--    3. 以 ANSI charset 写回另一个 Stream
+--    4. 以 binary 模式读出 ANSI 字节
 --
 --  使用:
 --    local enc = require("excel").encoding
@@ -928,41 +934,125 @@ function encoding.getACP()
     return tonumber((r:match("(%d+)")))
 end
 
---- UTF-8 → 系统 ANSI (通过 powershell)
+--- 代码页号 → ADODB.Stream charset 名称
+local function acpToCharset(acp)
+    local map = {
+        [936]   = "gb2312",
+        [950]   = "big5",
+        [54936] = "gb18030",
+        [932]   = "shift_jis",
+        [949]   = "ks_c_5601-1987",
+        [874]   = "windows-874",
+        [1250]  = "windows-1250",
+        [1251]  = "windows-1251",
+        [1252]  = "windows-1252",
+        [1253]  = "windows-1253",
+        [1254]  = "windows-1254",
+        [1255]  = "windows-1255",
+        [1256]  = "windows-1256",
+        [1257]  = "windows-1257",
+        [1258]  = "windows-1258",
+    }
+    return map[acp] or ("windows-" .. acp)
+end
+
+--- 获取 ADODB.Stream 对象 (延迟加载 luacom)
+local function createStream()
+    if not luacom then
+        luacom = require("luacom")
+    end
+    local stream = luacom.CreateObject("ADODB.Stream")
+    if stream then
+        stream.Type = 1  -- binary
+        stream:Open()
+    end
+    return stream
+end
+
+--- 将 Lua 字符串逐字节写入 binary Stream (绕过 LuaCOM 的 BSTR 编码转换)
+local function streamWriteBytes(stream, str)
+    -- ADODB.Stream.Write 在 binary 模式下接受 VT_ARRAY|VT_UI1
+    -- 先构建字节表，然后通过 COM 写入
+    local n = #str
+    if n == 0 then return end
+    -- 尝试直接写入字符串 (部分 LuaCOM 版本支持)
+    local ok = pcall(function() stream:Write(str) end)
+    if ok then return end
+    -- 后备: 逐字节写入 (慢但可靠)
+    for i = 1, n do
+        stream:Write(string.byte(str, i))
+    end
+end
+
+--- UTF-8 → 系统 ANSI (通过 ADODB.Stream COM)
 function encoding.toACP(utf8_str)
     if not encoding.isWindows() then return utf8_str end
-    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
-    local f = io.open(tmp_in, "wb")
-    if not f then return nil end
-    f:write(utf8_str); f:close()
-    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::UTF8), [System.Text.Encoding]::Default)" 2>&1]]
-    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
-    local h = io.popen(cmd, "r")
-    if not h then os.remove(tmp_in); return nil end
-    h:close()
-    local f2 = io.open(tmp_out, "rb")
-    if not f2 then os.remove(tmp_in); return nil end
-    local result = f2:read("*a"); f2:close()
-    os.remove(tmp_in); os.remove(tmp_out)
+    local acp = encoding.getACP()
+    if not acp then return utf8_str end
+    if #utf8_str == 0 then return utf8_str end
+
+    local ok, result = pcall(function()
+        -- Step 1: 将 UTF-8 字节写入 binary stream, 以 UTF-8 charset 读取为 Unicode
+        local s1 = createStream()
+        if not s1 then return nil end
+        streamWriteBytes(s1, utf8_str)
+        s1.Position = 0
+        s1.Type = 2  -- text
+        s1.Charset = "utf-8"
+        local unicode = s1:ReadText()
+        s1:Close()
+
+        -- Step 2: 将 Unicode 以 ANSI charset 写入 text stream, binary 读出 ANSI 字节
+        local s2 = createStream()
+        if not s2 then return nil end
+        s2.Type = 2  -- text
+        s2.Charset = acpToCharset(acp)
+        s2:WriteText(unicode)
+        s2.Position = 0
+        s2.Type = 1  -- binary
+        local ansi = s2:Read(s2.Size)
+        s2:Close()
+
+        return ansi
+    end)
+
+    if not ok then return nil end
     return result
 end
 
---- 系统 ANSI → UTF-8 (通过 powershell, 不含 BOM)
+--- 系统 ANSI → UTF-8 (通过 ADODB.Stream COM, 不含 BOM)
 function encoding.toUTF8(ansi_str)
     if not encoding.isWindows() then return ansi_str end
-    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
-    local f = io.open(tmp_in, "wb")
-    if not f then return nil end
-    f:write(ansi_str); f:close()
-    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $enc=New-Object System.Text.UTF8Encoding $false; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::Default), $enc)" 2>&1]]
-    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
-    local h = io.popen(cmd, "r")
-    if not h then os.remove(tmp_in); return nil end
-    h:close()
-    local f2 = io.open(tmp_out, "rb")
-    if not f2 then os.remove(tmp_in); return nil end
-    local result = f2:read("*a"); f2:close()
-    os.remove(tmp_in); os.remove(tmp_out)
+    local acp = encoding.getACP()
+    if not acp then return ansi_str end
+    if #ansi_str == 0 then return ansi_str end
+
+    local ok, result = pcall(function()
+        -- Step 1: 将 ANSI 字节写入 binary stream, 以 ANSI charset 读取为 Unicode
+        local s1 = createStream()
+        if not s1 then return nil end
+        streamWriteBytes(s1, ansi_str)
+        s1.Position = 0
+        s1.Type = 2  -- text
+        s1.Charset = acpToCharset(acp)
+        local unicode = s1:ReadText()
+        s1:Close()
+
+        -- Step 2: 将 Unicode 以 UTF-8 charset 写入 text stream, binary 读出 UTF-8 字节
+        local s2 = createStream()
+        if not s2 then return nil end
+        s2.Type = 2  -- text
+        s2.Charset = "utf-8"
+        s2:WriteText(unicode)
+        s2.Position = 0
+        s2.Type = 1  -- binary
+        local utf8 = s2:Read(s2.Size)
+        s2:Close()
+
+        return utf8
+    end)
+
+    if not ok then return nil end
     return result
 end
 

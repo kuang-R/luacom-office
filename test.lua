@@ -219,109 +219,34 @@ function Logger:close()
     if self._fh then self._fh:close(); self._fh = nil end
 end
 
-----------------------------------------------------------------------
---  Encoding  --  UTF-8 <-> 系统 ANSI (GBK/CP936) 转码
---
---  为什么需要:
---    Windows 中文系统 (CP936/GBK) 上，Lua 字符串字面量若源文件为 UTF-8，
---    其字节也是 UTF-8。但 LuaCOM 传给 Excel 时，Excel 期望系统 ANSI 编码。
---    因此需将 UTF-8 字符串转为 GBK 再写入 Excel。
---
---  工作原理:
---    将待转码字符串写入临时文件 → powershell 读取并重编码 → 读回结果
-----------------------------------------------------------------------
-local encoding = { _log = nil }
+--  Encoding  —  复用 excel.encoding (ADODB.Stream COM 转码, 无需 powershell)
+local encoding = excel.encoding
 
-function encoding.isWindows()
-    return package.config:sub(1, 1) == "\\"
+-- 轻量包装: 记录转换前后字节到日志 (便于调试)
+local _raw_toACP, _raw_toUTF8, _raw_forExcel = encoding.toACP, encoding.toUTF8, encoding.forExcel
+
+function encoding.toACP(s)
+    if encoding._log then encoding._log:bytes("toACP input", s) end
+    local r = _raw_toACP(s)
+    if encoding._log and r then encoding._log:bytes("toACP output", r) end
+    return r
 end
 
-function encoding.getACP()
-    if not encoding.isWindows() then return nil end
-    local h = io.popen("chcp 2>nul", "r")
-    if not h then return nil end
-    local r = h:read("*a")
-    h:close()
-    local acp = r:match("(%d+)")
-    local num = acp and tonumber(acp) or nil
-    if encoding._log and num then encoding._log:data("ACP codepage", num) end
-    return num
+function encoding.toUTF8(s)
+    if encoding._log then encoding._log:bytes("toUTF8 input", s) end
+    local r = _raw_toUTF8(s)
+    if encoding._log and r then encoding._log:bytes("toUTF8 output", r) end
+    return r
 end
 
-function encoding.toACP(utf8_str)
-    if not encoding.isWindows() then return utf8_str end
-    if encoding._log then encoding._log:bytes("toACP input", utf8_str) end
-    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
-    local f = io.open(tmp_in, "wb")
-    if not f then return nil, "cannot create temp file" end
-    f:write(utf8_str)
-    f:close()
-    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::UTF8), [System.Text.Encoding]::Default)" 2>&1]]
-    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
-    local h = io.popen(cmd, "r")
-    if not h then os.remove(tmp_in); return nil, "popen failed" end
-    local stderr_out = h:read("*a")
-    h:close()
-    local f2 = io.open(tmp_out, "rb")
-    if not f2 then
-        if encoding._log then encoding._log:detail("toACP stderr: " .. (stderr_out:gsub("%s+", " ") or "(none)")) end
-        os.remove(tmp_in); return nil, "no output"
+function encoding.forExcel(s)
+    if encoding._log then encoding._log:bytes("forExcel input", s) end
+    local r = _raw_forExcel(s)
+    if encoding._log then
+        if r == s then encoding._log:detail("forExcel: passthrough")
+        else encoding._log:detail("forExcel: converted") end
     end
-    local result = f2:read("*a")
-    f2:close()
-    os.remove(tmp_in); os.remove(tmp_out)
-    if #result == 0 and #utf8_str > 0 then
-        if encoding._log then encoding._log:detail("toACP empty; stderr: " .. stderr_out:gsub("%s+", " ")) end
-        return nil, "empty output"
-    end
-    if encoding._log then encoding._log:bytes("toACP output", result) end
-    return result
-end
-
-function encoding.toUTF8(ansi_str)
-    if not encoding.isWindows() then return ansi_str end
-    if encoding._log then encoding._log:bytes("toUTF8 input", ansi_str) end
-    local tmp_in, tmp_out = os.tmpname(), os.tmpname()
-    local f = io.open(tmp_in, "wb")
-    if not f then return nil end
-    f:write(ansi_str)
-    f:close()
-    -- UTF8Encoding($false) = 不带 BOM
-    local ps = [[powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $enc=New-Object System.Text.UTF8Encoding $false; [System.IO.File]::WriteAllText('__OUT__', [System.IO.File]::ReadAllText('__IN__', [System.Text.Encoding]::Default), $enc)" 2>&1]]
-    local cmd = ps:gsub("__OUT__", tmp_out):gsub("__IN__", tmp_in)
-    local h = io.popen(cmd, "r")
-    if not h then os.remove(tmp_in); return nil end
-    local stderr_out = h:read("*a")
-    h:close()
-    local f2 = io.open(tmp_out, "rb")
-    if not f2 then
-        if encoding._log then encoding._log:detail("toUTF8 stderr: " .. stderr_out:gsub("%s+", " ")) end
-        os.remove(tmp_in); return nil
-    end
-    local result = f2:read("*a")
-    f2:close()
-    os.remove(tmp_in); os.remove(tmp_out)
-    if encoding._log then encoding._log:bytes("toUTF8 output", result) end
-    return result
-end
-
---- 为写入 Excel 准备字符串: 中文系统上 UTF-8 → GBK, 其他环境原样返回
-function encoding.forExcel(str)
-    if encoding._log then encoding._log:bytes("forExcel input", str) end
-    if encoding.isWindows() then
-        local acp = encoding.getACP()
-        if acp == 936 or acp == 950 or acp == 54936 then
-            local converted, err = encoding.toACP(str)
-            if converted then
-                if encoding._log then encoding._log:detail("forExcel: UTF8->ACP(" .. acp .. ")") end
-                return converted
-            elseif encoding._log then
-                encoding._log:warn("forExcel conversion failed: " .. (err or "?"))
-            end
-        end
-    end
-    if encoding._log then encoding._log:detail("forExcel: passthrough") end
-    return str
+    return r
 end
 
 -- ============================================================================
