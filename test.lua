@@ -441,6 +441,11 @@ local function part3_encoding(log)
         log:skip(id, "not Windows")
         return
     end
+    local acp = encoding.getACP()
+    if acp ~= 936 and acp ~= 950 and acp ~= 54936 then
+        log:skip(id, "non-Chinese codepage " .. (acp or "?"))
+        return
+    end
 
     local original = "\230\181\139\232\175\149"  -- UTF-8 "测试" = E6 B5 8B E8 AF 95
     local ansi = encoding.toACP(original)         -- → GBK "测试" = B2 E2 CA D4
@@ -630,20 +635,24 @@ local function part4_excel(log)
         log:pass(id)
 
         -- [13] 工作表增删
-        --      在 s1 之后新建 "第二表" (中文名转码) → 断言总数=2
-        --      写入测试数据后删除 → 断言总数=1
+        --      在 s1 之后新建 "第二表" → 断言增加 1 → 删除 → 断言恢复
+        --      使用相对计数避免 Excel 版本差异 (2010 默认 3 张, 2016+ 默认 1 张)
         id = log:step("Add & delete worksheet")
+        local initial_count = wb:sheetCount()
         local s2 = wb:addSheet(encoding.forExcel("\231\172\172\228\186\140\232\161\168"), s1)  -- "第二表"
-        log:data("count after add", wb:sheetCount())
-        if wb:sheetCount() ~= 2 then
-            log:fail(id, "expected 2 sheets, got " .. wb:sheetCount())
+        local after_add = wb:sheetCount()
+        log:data("initial count", initial_count)
+        log:data("count after add", after_add)
+        if after_add ~= initial_count + 1 then
+            log:fail(id, string.format("expected %d, got %d", initial_count + 1, after_add))
             all_ok = false
         else
             s2:cell(1, 1, "tmp")
             wb:deleteSheet(s2:name())
-            log:data("count after delete", wb:sheetCount())
-            if wb:sheetCount() ~= 1 then
-                log:fail(id, "expected 1 sheet after delete, got " .. wb:sheetCount())
+            local after_delete = wb:sheetCount()
+            log:data("count after delete", after_delete)
+            if after_delete ~= initial_count then
+                log:fail(id, string.format("expected %d, got %d", initial_count, after_delete))
                 all_ok = false
             else
                 log:pass(id)
