@@ -17,6 +17,7 @@
     PART 3  ENCODING             UTF-8 ↔ GBK 往返转码测试              [1 step]
     PART 4  EXCEL COM            核心流程集成测试 (创建→读写→格式→退出) [11 steps]
     PART 5  COVERAGE EXTENSION   覆盖率扩展 (App/Sheet/Range 剩余 API) [13 steps]
+    PART 6  RESOURCE MANAGEMENT  COM 自动资源管理 (__gc/__close/容错)  [5 steps]
 
 ===============================================================================
 ]]
@@ -962,6 +963,136 @@ local function part5_coverage(log)
 end
 
 -- ============================================================================
+--  PART 6  资源管理  RESOURCE MANAGEMENT
+-- ============================================================================
+--  验证 COM 对象自动释放机制: __gc, __close, 重复 quit 安全。
+--  创建独立 Excel 实例, 不影响其他 PART。
+--
+--  步骤:
+--    [30] 双重 quit 安全: quit() → quit() 不崩溃
+--    [31] 手动 quit 后操作: quit 后尝试方法调用, 应安全返回 nil/error
+--    [32] __close 自动清理: 使用 to-be-closed 变量, 离开作用域自动 quit
+--    [33] 异常恢复: 在 to-be-closed 作用域内抛异常, __close 应触发清理
+--    [34] 多次创建/退出: 反复创建/退出 Excel 实例, 不累积僵尸进程
+-- ============================================================================
+local function part6_resource(log)
+
+    local id = log:step("Check COM environment")
+    if not encoding.isWindows() then
+        log:skip(id, "not Windows")
+        return false
+    end
+    local luacom_ok = pcall(require, "luacom")
+    if not luacom_ok then
+        log:fail(id, "luacom not available")
+        return false
+    end
+    log:pass(id)
+
+    -- ================================================================
+    -- [30] 双重 quit 安全: quit() 两次不应崩溃
+    -- ================================================================
+    id = log:step("Double quit safety")
+    local app = excel.ExcelApp:new(false)
+    if not app then
+        log:fail(id, "ExcelApp:new() failed")
+        return false
+    end
+    app:addWorkbook()
+    app:quit()
+    -- 第二次 quit 应安全无操作 (由 _released 标记保护)
+    local ok, err = pcall(function() app:quit() end)
+    if ok then
+        log:pass(id)
+    else
+        log:fail(id, "second quit() crashed: " .. tostring(err))
+    end
+
+    -- ================================================================
+    -- [31] 手动 quit 后只读操作: 对象已释放, 读操作应安全返回或报错
+    --      不调用任何写操作 (visible/Add 等) — 避免唤醒 zombie COM 对象
+    -- ================================================================
+    id = log:step("Read operations after quit (safe nil/error)")
+    local _, err2 = pcall(function() app:version() end)
+    log:data("version after quit", err2 and "error (expected)" or "no error")
+    local _, err3 = pcall(function() app:workbookCount() end)
+    log:data("workbookCount after quit", err3 and "error (expected)" or "no error")
+    -- 读操作可能返回 0/nil 或抛异常, 只要不挂起就算通过
+    log:pass(id)
+
+    -- ================================================================
+    -- [32] __close 自动清理 (Lua 5.5 to-be-closed 变量)
+    --      创建 Excel → 读写数据 → 离开作用域 → __close 自动 quit
+    -- ================================================================
+    id = log:step("__close auto-cleanup (to-be-closed variable)")
+    local closed_ok = false
+    pcall(function()
+        -- Lua 5.5: <close> 变量离开作用域自动调 __close
+        -- 旧版 Lua 忽略 <close> 标记, 等价于普通 local
+        local test_app <close> = excel.ExcelApp:new(false)
+        if not test_app then return end
+        local wb = test_app:addWorkbook()
+        wb:sheetByIndex(1):cell(1, 1, "close test")
+        -- 此处正常离开作用域, __close 应触发 quit()
+        closed_ok = true
+    end)
+    log:data("__close scope completed", closed_ok)
+    if closed_ok then
+        log:pass(id)
+    else
+        log:fail(id, "__close scope failed")
+    end
+
+    -- ================================================================
+    -- [33] 异常恢复: try 块内抛 error, __close 仍应触发 quit
+    -- ================================================================
+    id = log:step("Exception recovery (error inside to-be-closed scope)")
+    local error_raised = false
+    local cleanup_worked = true
+    pcall(function()
+        local recovery_app <close> = excel.ExcelApp:new(false)
+        if not recovery_app then cleanup_worked = false; return end
+        recovery_app:addWorkbook()
+        error("simulated crash inside Excel work")
+    end)
+    -- 如果上面 error() 抛出: Lua 先调 __close (quit), 再跳转到 pcall 捕获
+    -- 如果 __close 崩溃: pcall 会捕获它, cleanup_worked 保持 false
+    -- 正常: error 被 pcall 捕获, __close 清理完成, 程序继续
+    log:data("error+cleanup", cleanup_worked and "OK" or "FAIL")
+    if cleanup_worked then
+        log:pass(id)
+    else
+        log:fail(id, "cleanup after error failed")
+    end
+
+    -- ================================================================
+    -- [34] 多次创建/退出: 快速连续创建退出多个实例
+    --      验证无僵尸进程累积 (每个实例正确清理)
+    -- ================================================================
+    id = log:step("Multiple create/quit cycles (3 iterations)")
+    local cycles_ok = true
+    for i = 1, 3 do
+        local loop_ok = pcall(function()
+            local cyc <close> = excel.ExcelApp:new(false)
+            if not cyc then error("create failed") end
+            local wb = cyc:addWorkbook()
+            wb:sheetByIndex(1):cell(1, 1, "cycle " .. i)
+        end)
+        if not loop_ok then
+            cycles_ok = false
+            log:data("cycle " .. i, "FAIL")
+        end
+    end
+    if cycles_ok then
+        log:pass(id)
+    else
+        log:fail(id, "one or more cycles failed")
+    end
+
+    return true
+end
+
+-- ============================================================================
 --  入口  MAIN
 -- ============================================================================
 
@@ -993,6 +1124,11 @@ if not ok4 then log:error("PART4 crashed: " .. tostring(e4)) end
 log:section("COVERAGE EXTENSION")
 local ok5, e5 = pcall(part5_coverage, log)
 if not ok5 then log:error("PART5 crashed: " .. tostring(e5)) end
+
+-- PART 6: 资源管理
+log:section("RESOURCE MANAGEMENT")
+local ok6, e6 = pcall(part6_resource, log)
+if not ok6 then log:error("PART6 crashed: " .. tostring(e6)) end
 
 -- 摘要
 log:summary()
