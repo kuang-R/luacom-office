@@ -103,6 +103,18 @@ ExcelRange.__index = ExcelRange
 -- ============================================================================
 --  内部: 创建 Lua wrapper 对象的工厂
 -- ============================================================================
+
+--- 标记 COM 对象已由用户手动释放，阻止 __gc 重复清理
+local RELEASED = {}
+
+local function markReleased(wrapper)
+    wrapper._released = true
+end
+
+local function isReleased(wrapper)
+    return wrapper._released == true
+end
+
 local function newWrapper(cls, com_obj)
     return setmetatable({ _com = com_obj }, cls)
 end
@@ -111,11 +123,31 @@ end
 --  Class: ExcelApp  —  Excel 应用程序
 -- ============================================================================
 
+--- GC 终结器: 对象被回收时自动关闭 Excel (阻止僵尸进程)
+function ExcelApp.__gc(app)
+    if not isReleased(app) then
+        pcall(function() ExcelApp.quit(app) end)
+    end
+end
+
+--- to-be-closed 支持: Lua 5.5 `local app <close> = ExcelApp:new()`
+--- 变量离开作用域时自动调用 (优于 __gc — 确定性释放)
+function ExcelApp.__close(app, _err)
+    if not isReleased(app) then
+        pcall(function() ExcelApp.quit(app) end)
+    end
+end
+
 --- 创建/连接 Excel 实例
 ---
+--- 支持自动资源管理:
+---   GC: 对象被回收时自动调 quit()  → 防僵尸 Excel 进程
+---   to-be-closed: `local app <close> = ExcelApp:new()` → 离开作用域自动释放
+---
 ---```lua
----local app = ExcelApp:new()       -- 不可见, DisplayAlerts 关闭, ScreenUpdating 关闭
----local app = ExcelApp:new(true)   -- 可见 (调试)
+---local app = ExcelApp:new()             -- 不可见 (默认)
+---local app = ExcelApp:new(true)         -- 可见 (调试)
+---local app <close> = ExcelApp:new()     -- 自动清理 (Lua 5.5)
 ---```
 ---
 ---@param visible boolean|nil 是否显示窗口 (默认 false)
@@ -214,12 +246,15 @@ end
 ---
 ---@param save_all boolean|nil
 function ExcelApp:quit(save_all)
+    if isReleased(self) then return end  -- 已退出，防止重复调用
+    markReleased(self)
+    -- 关闭所有工作簿 (容错: 每个 wb 独立 pcall, 一个失败不影响其他)
     for i = self._com.Workbooks.Count, 1, -1 do
         local wb = self._com.Workbooks(i)
         if save_all then pcall(function() wb:Save() end) end
         pcall(function() wb:Close(false) end)  -- false = 不保存
     end
-    self._com:Quit()
+    pcall(function() self._com:Quit() end)
 end
 
 -- ============================================================================
