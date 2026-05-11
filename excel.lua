@@ -104,9 +104,6 @@ ExcelRange.__index = ExcelRange
 --  内部: 创建 Lua wrapper 对象的工厂
 -- ============================================================================
 
---- 标记 COM 对象已由用户手动释放，阻止 __gc 重复清理
-local RELEASED = {}
-
 local function markReleased(wrapper)
     wrapper._released = true
 end
@@ -905,13 +902,8 @@ function ExcelRange:deleteColumns()  self._com.EntireColumn:Delete(); end
 -- ============================================================================
 --  在中文 Windows (CP936) 上，LuaCOM 需要 ANSI/GBK 编码的字符串才能
 --  正确写入 Excel。若源文件为 UTF-8 without BOM，中文会出现乱码。
---  本模块通过 ADODB.Stream COM 接口实现编码转换，无需 powershell 或临时文件。
---
---  原理:
---    1. 将 UTF-8 字节写入 ADODB.Stream (binary 模式, 避免 LuaCOM 的 BSTR 转换)
---    2. 以 UTF-8 charset 读取为 Unicode 文本
---    3. 以 ANSI charset 写回另一个 Stream
---    4. 以 binary 模式读出 ANSI 字节
+--  本模块通过 FFI 调用 Win32 API (MultiByteToWideChar / WideCharToMultiByte)
+--  实现编码转换，无需 powershell、临时文件或额外 COM 对象。
 --
 --  使用:
 --    local enc = require("excel").encoding
@@ -934,58 +926,7 @@ function encoding.getACP()
     return tonumber((r:match("(%d+)")))
 end
 
---- 代码页号 → ADODB.Stream charset 名称
-local function acpToCharset(acp)
-    local map = {
-        [936]   = "gb2312",
-        [950]   = "big5",
-        [54936] = "gb18030",
-        [932]   = "shift_jis",
-        [949]   = "ks_c_5601-1987",
-        [874]   = "windows-874",
-        [1250]  = "windows-1250",
-        [1251]  = "windows-1251",
-        [1252]  = "windows-1252",
-        [1253]  = "windows-1253",
-        [1254]  = "windows-1254",
-        [1255]  = "windows-1255",
-        [1256]  = "windows-1256",
-        [1257]  = "windows-1257",
-        [1258]  = "windows-1258",
-    }
-    return map[acp] or ("windows-" .. acp)
-end
-
---- 获取 ADODB.Stream 对象 (延迟加载 luacom)
-local function createStream()
-    if not luacom then
-        luacom = require("luacom")
-    end
-    local stream = luacom.CreateObject("ADODB.Stream")
-    if stream then
-        stream.Type = 1  -- binary
-        stream:Open()
-    end
-    return stream
-end
-
---- 将 Lua 字符串逐字节写入 binary Stream (绕过 LuaCOM 的 BSTR 编码转换)
-local function streamWriteBytes(stream, str)
-    -- ADODB.Stream.Write 在 binary 模式下接受 VT_ARRAY|VT_UI1
-    -- 先构建字节表，然后通过 COM 写入
-    local n = #str
-    if n == 0 then return end
-    -- 尝试直接写入字符串 (部分 LuaCOM 版本支持)
-    local ok = pcall(function() stream:Write(str) end)
-    if ok then return end
-    -- 后备: 逐字节写入 (慢但可靠)
-    for i = 1, n do
-        stream:Write(string.byte(str, i))
-    end
-end
-
---- UTF-8 → 系统 ANSI (通过 ADODB.Stream COM)
---- 延迟加载 FFI (仅 Windows 需要)
+-- 延迟加载 FFI (仅 Windows 需要)
 local _ffi_ready = false
 local function _initFFI()
     if _ffi_ready then return true end
