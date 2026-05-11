@@ -985,75 +985,67 @@ local function streamWriteBytes(stream, str)
 end
 
 --- UTF-8 → 系统 ANSI (通过 ADODB.Stream COM)
+--- 延迟加载 FFI (仅 Windows 需要)
+local _ffi_ready = false
+local function _initFFI()
+    if _ffi_ready then return true end
+    local ok, ffi = pcall(require, "ffi")
+    if not ok then return false end
+    pcall(function()
+        ffi.cdef([[
+            typedef unsigned short wchar_t;
+            int MultiByteToWideChar(unsigned int, unsigned long,
+                const char*, int, wchar_t*, int);
+            int WideCharToMultiByte(unsigned int, unsigned long,
+                const wchar_t*, int, char*, int,
+                const char*, int*);
+        ]])
+    end)
+    _ffi_ready = true
+    return true
+end
+local function _ffi() return require("ffi") end
+
+--- UTF-8 → 系统 ANSI (Win32 MultiByteToWideChar → WideCharToMultiByte)
 function encoding.toACP(utf8_str)
     if not encoding.isWindows() then return utf8_str end
-    local acp = encoding.getACP()
-    if not acp then return utf8_str end
     if #utf8_str == 0 then return utf8_str end
-
+    if not _initFFI() then return nil end
+    local ffi = _ffi()
     local ok, result = pcall(function()
-        -- Step 1: 将 UTF-8 字节写入 binary stream, 以 UTF-8 charset 读取为 Unicode
-        local s1 = createStream()
-        if not s1 then return nil end
-        streamWriteBytes(s1, utf8_str)
-        s1.Position = 0
-        s1.Type = 2  -- text
-        s1.Charset = "utf-8"
-        local unicode = s1:ReadText()
-        s1:Close()
-
-        -- Step 2: 将 Unicode 以 ANSI charset 写入 text stream, binary 读出 ANSI 字节
-        local s2 = createStream()
-        if not s2 then return nil end
-        s2.Type = 2  -- text
-        s2.Charset = acpToCharset(acp)
-        s2:WriteText(unicode)
-        s2.Position = 0
-        s2.Type = 1  -- binary
-        local ansi = s2:Read(s2.Size)
-        s2:Close()
-
-        return ansi
+        local C, src = ffi.C, utf8_str
+        local wlen = C.MultiByteToWideChar(65001, 0, src, #src, nil, 0)
+        if wlen == 0 then return nil end
+        local wbuf = ffi.new("wchar_t[?]", wlen + 1)
+        C.MultiByteToWideChar(65001, 0, src, #src, wbuf, wlen)
+        local alen = C.WideCharToMultiByte(0, 0, wbuf, wlen, nil, 0, nil, nil)
+        if alen == 0 then return nil end
+        local abuf = ffi.new("char[?]", alen + 1)
+        C.WideCharToMultiByte(0, 0, wbuf, wlen, abuf, alen, nil, nil)
+        return ffi.string(abuf, alen)
     end)
-
-    if not ok then return nil end
-    return result
+    if not ok then return nil else return result end
 end
 
---- 系统 ANSI → UTF-8 (通过 ADODB.Stream COM, 不含 BOM)
+--- 系统 ANSI → UTF-8 (Win32 MultiByteToWideChar → WideCharToMultiByte)
 function encoding.toUTF8(ansi_str)
     if not encoding.isWindows() then return ansi_str end
-    local acp = encoding.getACP()
-    if not acp then return ansi_str end
     if #ansi_str == 0 then return ansi_str end
-
+    if not _initFFI() then return nil end
+    local ffi = _ffi()
     local ok, result = pcall(function()
-        -- Step 1: 将 ANSI 字节写入 binary stream, 以 ANSI charset 读取为 Unicode
-        local s1 = createStream()
-        if not s1 then return nil end
-        streamWriteBytes(s1, ansi_str)
-        s1.Position = 0
-        s1.Type = 2  -- text
-        s1.Charset = acpToCharset(acp)
-        local unicode = s1:ReadText()
-        s1:Close()
-
-        -- Step 2: 将 Unicode 以 UTF-8 charset 写入 text stream, binary 读出 UTF-8 字节
-        local s2 = createStream()
-        if not s2 then return nil end
-        s2.Type = 2  -- text
-        s2.Charset = "utf-8"
-        s2:WriteText(unicode)
-        s2.Position = 0
-        s2.Type = 1  -- binary
-        local utf8 = s2:Read(s2.Size)
-        s2:Close()
-
-        return utf8
+        local C, src = ffi.C, ansi_str
+        local wlen = C.MultiByteToWideChar(0, 0, src, #src, nil, 0)
+        if wlen == 0 then return nil end
+        local wbuf = ffi.new("wchar_t[?]", wlen + 1)
+        C.MultiByteToWideChar(0, 0, src, #src, wbuf, wlen)
+        local ulen = C.WideCharToMultiByte(65001, 0, wbuf, wlen, nil, 0, nil, nil)
+        if ulen == 0 then return nil end
+        local ubuf = ffi.new("char[?]", ulen + 1)
+        C.WideCharToMultiByte(65001, 0, wbuf, wlen, ubuf, ulen, nil, nil)
+        return ffi.string(ubuf, ulen)
     end)
-
-    if not ok then return nil end
-    return result
+    if not ok then return nil else return result end
 end
 
 --- 为写入 Excel 准备字符串
