@@ -1007,8 +1007,6 @@ end
 -- ============================================================================
 --  Class: WordApp  —  Word 应用程序
 -- ============================================================================
-local WordApp = {}
-WordApp.__index = WordApp
 
 function WordApp.__gc(app)
     if not isReleased(app) then
@@ -1083,8 +1081,6 @@ end
 -- ============================================================================
 --  Class: WordDocument  —  Word 文档
 -- ============================================================================
-local WordDocument = {}
-WordDocument.__index = WordDocument
 
 function WordDocument:new(com_doc)
     return newWrapper(WordDocument, com_doc)
@@ -1099,8 +1095,11 @@ function WordDocument:path()     return self._com.FullName end
 ---@return WordRange
 function WordDocument:range(start, end_)
     local s = start or 0
-    local e = end_ or self._com.Content:End_()
-    return newWrapper(WordRange, self._com:Range(s, e))
+    if not end_ then
+        -- Content.End 返回文档末尾位置
+        end_ = self._com.Content.End_
+    end
+    return newWrapper(WordRange, self._com:Range(s, end_))
 end
 
 --- 全文 Range
@@ -1131,8 +1130,6 @@ end
 -- ============================================================================
 --  Class: WordRange  —  Word 文档区域
 -- ============================================================================
-local WordRange = {}
-WordRange.__index = WordRange
 
 function WordRange:new(com_range)
     return newWrapper(WordRange, com_range)

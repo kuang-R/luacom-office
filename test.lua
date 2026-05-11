@@ -18,6 +18,7 @@
     PART 4  EXCEL COM            核心流程集成测试 (创建→读写→格式→退出) [11 steps]
     PART 5  COVERAGE EXTENSION   覆盖率扩展 (App/Sheet/Range 剩余 API + saveAs) [14 steps]
     PART 6  RESOURCE MANAGEMENT  COM 自动资源管理 (__gc/__close/容错)  [5 steps]
+    PART 7  WORD COM            Word 集成测试 (创建→读写→格式→表格→保存) [10 steps]
 
 ===============================================================================
 ]]
@@ -1084,6 +1085,164 @@ local function part6_resource(log)
 end
 
 -- ============================================================================
+--  PART 7  Word COM 集成测试  WORD COM
+-- ============================================================================
+--  测试 Word COM 核心功能：创建文档、读写文本、格式化、表格、保存。
+--
+--  步骤:
+--    [30] Check COM environment (Word)
+--    [31] Create Word.Application
+--    [32] Add document + write text
+--    [33] Format text (bold, italic, font, color, align)
+--    [34] Read back text + insert paragraph
+--    [35] Insert table + write cell
+--    [36] Copy & paste
+--    [37] Document info (name, path, counts)
+--    [38] SaveAs + verify file exists
+--    [39] Quit Word
+-- ============================================================================
+local function part7_word(log)
+
+    local id = log:step("Check COM environment (Word)")
+    if not encoding.isWindows() then
+        log:skip(id, "not Windows")
+        return false
+    end
+    local luacom_ok = pcall(require, "luacom")
+    if not luacom_ok then
+        log:fail(id, "luacom not available")
+        return false
+    end
+    log:pass(id)
+
+    -- [31] Create Word
+    id = log:step("Create Word.Application")
+    local word = office.WordApp:new(false)
+    if not word then
+        log:fail(id, "WordApp:new() returned nil")
+        return false
+    end
+    word:displayAlerts(false)
+    log:pass(id)
+
+    local all_ok = true
+    local worked, run_err = pcall(function()
+
+        -- [32] Add document + write text
+        id = log:step("Add document + write text")
+        local doc = word:addDocument()
+        log:data("doc name", doc:name())
+        local rng = doc:content()
+        rng:text("Hello from LuaCOM Office library."):fontName("Arial"):fontSize(14)
+        log:data("text written", rng:text())
+        log:pass(id)
+
+        -- [33] Format text
+        id = log:step("Format text (bold, italic, color, align)")
+        rng:bold(true):italic(true):fontColor(0x0000FF):halign("Center")
+        log:data("bold", rng:bold())
+        log:data("italic", rng:italic())
+        log:assertion("bold == true", rng:bold() == true, true, rng:bold())
+        log:assertion("italic == true", rng:italic() == true, true, rng:italic())
+        log:pass(id)
+
+        -- [34] Read back + insert paragraph
+        id = log:step("Read back + insert paragraph")
+        local txt = doc:content():text()
+        log:data("full text", txt:sub(1, 40))
+        log:assertion("text not empty", #txt > 0, true, #txt > 0)
+
+        -- 在文档末尾追加段落 (先取全文, 在末尾加换行和新文本)
+        local c = doc:content()
+        c:text(c:text() .. "\r\nSecond paragraph.")
+        local para_count = doc:paragraphCount()
+        log:data("paragraph count", para_count)
+        log:assertion("paragraphCount>=2", para_count >= 2, ">=2", para_count)
+        log:pass(id)
+
+        -- [35] Insert table
+        id = log:step("Insert table (at end of document)")
+        -- 在文档末尾追加换行, 然后插入 3x3 表格
+        local c = doc:content()
+        c:text(c:text() .. "\r\n")
+        local tbl = c:insertTable(3, 3)
+        tbl:text("table cell")
+        local tbl_count = doc:tableCount()
+        log:data("table count", tbl_count)
+        log:assertion("tableCount>=1", tbl_count >= 1, ">=1", tbl_count)
+        log:pass(id)
+
+        -- [36] Copy & paste
+        id = log:step("Copy & paste")
+        local rng2 = doc:range(0, 10)
+        rng2:copy()
+        -- 在末尾粘贴: 用 content 定位到末尾
+        local c2 = doc:content()
+        c2:text(c2:text() .. "\r\n")
+        local paste_target = doc:content()
+        paste_target:paste()
+        log:info("copy/paste: OK")
+        log:pass(id)
+
+        -- [37] Document info
+        id = log:step("Document info (name, path, counts)")
+        log:data("name", doc:name())
+        log:data("path", doc:path() or "(unsaved)")
+        log:data("paragraphCount", doc:paragraphCount())
+        log:data("tableCount", doc:tableCount())
+        log:pass(id)
+
+        -- [38] SaveAs + verify file
+        id = log:step("SaveAs docx + verify file")
+        local function uniquePath(ext)
+            local tmp = os.tmpname()
+            pcall(function() os.remove(tmp) end)
+            local dir = tmp:match("^(.*)[\\/]") or "."
+            return dir .. "\\test_word_" .. string.gsub(os.date("%H%M%S"), "%.", "") .. "_" .. math.random(10000) .. ext
+        end
+        local docx_path = uniquePath(".docx")
+        log:data("saveAs path", docx_path)
+
+        local save_ok = pcall(function() doc:saveAs(docx_path) end)
+        local file_size = 0
+        local file_exists = false
+        if save_ok then
+            local fh = io.open(docx_path, "rb")
+            if fh then
+                file_size = fh:seek("end")
+                fh:close()
+                file_exists = file_size > 0
+            end
+        end
+        log:data("docx size", file_size .. " bytes")
+        pcall(function() os.remove(docx_path) end)
+        if file_exists then
+            log:pass(id)
+        else
+            log:fail(id, "file missing or empty")
+            all_ok = false
+        end
+
+        -- [39] Quit
+        id = log:step("Quit Word")
+        word:quit()
+        log:pass(id)
+    end)
+
+    -- 清理
+    pcall(function()
+        word:displayAlerts(false)
+        word:quit()
+    end)
+
+    if not worked then
+        log:error(run_err)
+        all_ok = false
+    end
+    return all_ok
+end
+
+-- ============================================================================
 --  入口  MAIN
 -- ============================================================================
 
@@ -1120,6 +1279,11 @@ if not ok5 then log:error("PART5 crashed: " .. tostring(e5)) end
 log:section("RESOURCE MANAGEMENT")
 local ok6, e6 = pcall(part6_resource, log)
 if not ok6 then log:error("PART6 crashed: " .. tostring(e6)) end
+
+-- PART 7: Word COM
+log:section("WORD COM")
+local ok7, e7 = pcall(part7_word, log)
+if not ok7 then log:error("PART7 crashed: " .. tostring(e7)) end
 
 -- 摘要
 log:summary()
