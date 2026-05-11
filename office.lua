@@ -1,50 +1,34 @@
 --[[
 ===============================================================================
-  Excel.lua  —  LuaCOM Excel 操作库
+  Office.lua  —  LuaCOM Excel/Word 操作库
 ===============================================================================
 
-  依赖:
-    Lua 5.5 + luacom    (Windows)
-    Excel 已安装
+  依赖: Lua 5.5 + luacom + ffi (Windows), Office 已安装
 
-  基本用法:
-    local excel = require("excel")
-
-    -- 创建 Excel 实例
-    local app = excel.ExcelApp:new()       -- 不可见 (默认)
-    local app = excel.ExcelApp:new(true)    -- 可见 (调试)
-
-    -- 工作簿
-    local wb = app:addWorkbook()            -- 新建
-    local wb = app:open("C:\\test.xlsx")    -- 打开
-
-    -- 工作表
-    local s = wb:sheet("Sheet1")            -- 按名称
-    local s = wb:sheetByIndex(1)            -- 按索引 (1-based)
-
-    -- 单元格读写
-    s:cell(1, 1, "Hello")                   -- 写入 A1
-    local v = s:cell(1, 1)                  -- 读取 A1
-
-    -- Range 操作
-    local r = s:range("A1:C10")             -- 获取区域
-    r:value("数据")                          -- 设置值
-    r:bold(true):halign("Center")           -- 格式化 (链式调用)
-    r:borderAll("Continuous")               -- 边框
-    r:autoFit()                              -- 自适应列宽
-
-    -- 保存 & 退出
+  -- Excel --
+    local office = require("office")
+    local app = office.ExcelApp:new()
+    local wb = app:addWorkbook()
+    local s = wb:sheetByIndex(1)
+    s:cell(1, 1, "Hello")
     wb:saveAs("C:\\result.xlsx")
     app:quit()
 
+  -- Word --
+    local word = office.WordApp:new()
+    local doc = word:addDocument()
+    doc:content():text("Hello World"):bold(true)
+    doc:saveAs("C:\\result.docx")
+    word:quit()
+
   编码说明:
-    Windows 中文系统 (CP936/GBK) 上，LuaCOM 需要 ANSI 编码的字符串。
-    若源文件为 UTF-8 without BOM，中文会出现乱码。解决方案:
-    1. 将 .lua 文件保存为 UTF-8 with BOM (推荐)
-    2. 或使用 encoding.forExcel() 包裹中文: s:cell(1,1, enc.forExcel("中文"))
+    中文 Windows 上 LuaCOM 需要 ANSI 编码字符串。
+    1. 保存 .lua 为 UTF-8 with BOM (推荐)
+    2. 或使用 encoding.forExcel("中文") / encoding.forExcel("表名")
 
   对象层级:
-    ExcelApp  →  ExcelWorkbook  →  ExcelSheet  →  ExcelRange
+    Excel: ExcelApp → ExcelWorkbook → ExcelSheet → ExcelRange
+    Word:  WordApp  → WordDocument  → WordRange
 
 ===============================================================================
 ]]
@@ -99,6 +83,15 @@ ExcelSheet.__index = ExcelSheet
 
 local ExcelRange = {}
 ExcelRange.__index = ExcelRange
+
+local WordApp = {}
+WordApp.__index = WordApp
+
+local WordDocument = {}
+WordDocument.__index = WordDocument
+
+local WordRange = {}
+WordRange.__index = WordRange
 
 -- ============================================================================
 --  内部: 创建 Lua wrapper 对象的工厂
@@ -1011,11 +1004,207 @@ end
 -- ============================================================================
 --  导出
 -- ============================================================================
+-- ============================================================================
+--  Class: WordApp  —  Word 应用程序
+-- ============================================================================
+local WordApp = {}
+WordApp.__index = WordApp
+
+function WordApp.__gc(app)
+    if not isReleased(app) then
+        pcall(function() WordApp.quit(app) end)
+    end
+end
+
+function WordApp.__close(app, _err)
+    if not isReleased(app) then
+        pcall(function() WordApp.quit(app) end)
+    end
+end
+
+--- 创建 Word 实例
+---
+---```lua
+---local word = office.WordApp:new()       -- 不可见
+---local word = office.WordApp:new(true)   -- 可见 (调试)
+---local word <close> = office.WordApp:new() -- 自动清理
+---```
+---@param visible boolean|nil
+---@return WordApp|nil
+function WordApp:new(visible)
+    luacom = require("luacom")
+    local com = luacom.CreateObject("Word.Application")
+    if not com then return nil end
+    com.Visible = visible and true or false
+    com.DisplayAlerts = false
+    com.ScreenUpdating = false
+    return newWrapper(WordApp, com)
+end
+
+function WordApp:visible(v)    self._com.Visible = v; return self end
+function WordApp:displayAlerts(v) self._com.DisplayAlerts = v; return self end
+function WordApp:screenUpdating(v) self._com.ScreenUpdating = v; return self end
+
+--- 打开已有文档
+---@return WordDocument
+function WordApp:open(path)
+    return newWrapper(WordDocument, self._com.Documents:Open(path))
+end
+
+--- 新建空白文档
+---@return WordDocument
+function WordApp:addDocument()
+    return newWrapper(WordDocument, self._com.Documents:Add())
+end
+
+function WordApp:documentCount() return self._com.Documents.Count end
+
+--- 按索引获取文档 (1-based)
+---@return WordDocument
+function WordApp:document(index)
+    return newWrapper(WordDocument, self._com.Documents(index))
+end
+
+function WordApp:version() return self._com.Version end
+
+--- 退出 Word
+---@param save_all boolean|nil
+function WordApp:quit(save_all)
+    if isReleased(self) then return end
+    markReleased(self)
+    for i = self._com.Documents.Count, 1, -1 do
+        local doc = self._com.Documents(i)
+        if save_all then pcall(function() doc:Save() end) end
+        pcall(function() doc:Close(false) end)
+    end
+    pcall(function() self._com:Quit() end)
+end
+
+-- ============================================================================
+--  Class: WordDocument  —  Word 文档
+-- ============================================================================
+local WordDocument = {}
+WordDocument.__index = WordDocument
+
+function WordDocument:new(com_doc)
+    return newWrapper(WordDocument, com_doc)
+end
+
+function WordDocument:name()     return self._com.Name end
+function WordDocument:path()     return self._com.FullName end
+
+--- 获取文档 Range (0=开头, -1=结尾, 省略则全文)
+---@param start integer|nil
+---@param end_ integer|nil
+---@return WordRange
+function WordDocument:range(start, end_)
+    local s = start or 0
+    local e = end_ or self._com.Content:End_()
+    return newWrapper(WordRange, self._com:Range(s, e))
+end
+
+--- 全文 Range
+---@return WordRange
+function WordDocument:content()
+    return newWrapper(WordRange, self._com.Content)
+end
+
+--- 段落数
+function WordDocument:paragraphCount()
+    return self._com.Paragraphs.Count
+end
+
+--- 表格数
+function WordDocument:tableCount()
+    return self._com.Tables.Count
+end
+
+function WordDocument:save()     self._com:Save() end
+function WordDocument:saveAs(path) self._com:SaveAs(path) end
+
+---@param save_changes boolean|nil
+function WordDocument:close(save_changes)
+    if save_changes == nil then save_changes = true end
+    self._com:Close(save_changes)
+end
+
+-- ============================================================================
+--  Class: WordRange  —  Word 文档区域
+-- ============================================================================
+local WordRange = {}
+WordRange.__index = WordRange
+
+function WordRange:new(com_range)
+    return newWrapper(WordRange, com_range)
+end
+
+--- 获取或设置文本
+---@overload fun():string
+---@overload fun(v:string):WordRange
+function WordRange:text(v)
+    if v ~= nil then self._com.Text = v; return self end
+    return self._com.Text
+end
+
+-- 字体
+---@overload fun():boolean
+---@overload fun(v:boolean):WordRange
+function WordRange:bold(v)
+    if v ~= nil then self._com.Font.Bold = v; return self end
+    return self._com.Font.Bold
+end
+
+---@overload fun():boolean
+---@overload fun(v:boolean):WordRange
+function WordRange:italic(v)
+    if v ~= nil then self._com.Font.Italic = v; return self end
+    return self._com.Font.Italic
+end
+
+function WordRange:fontName(name) self._com.Font.Name = name; return self end
+function WordRange:fontSize(size) self._com.Font.Size = size; return self end
+function WordRange:fontColor(rgb) self._com.Font.Color = rgb; return self end
+
+--- 段落对齐: "Left"|"Center"|"Right"|"Justify"
+function WordRange:halign(align)
+    local map = { Left = 0, Center = 1, Right = 2, Justify = 3 }
+    self._com.ParagraphFormat.Alignment = map[align] or align
+    return self
+end
+
+--- 复制 / 粘贴
+function WordRange:copy() self._com:Copy(); return self end
+function WordRange:paste() self._com:Paste(); return self end
+
+--- 插入段落
+---@return WordRange
+function WordRange:insertParagraph()
+    return newWrapper(WordRange, self._com:InsertParagraphAfter())
+end
+
+--- 插入表格
+---@param rows integer
+---@param cols integer
+---@return WordRange (table 区域)
+function WordRange:insertTable(rows, cols)
+    local tbl = self._com.Tables:Add(self._com, rows, cols)
+    return newWrapper(WordRange, tbl.Range)
+end
+
+-- ============================================================================
+--  导出
+-- ============================================================================
 return {
+    -- Excel
     ExcelApp      = ExcelApp,
     ExcelWorkbook = ExcelWorkbook,
     ExcelSheet    = ExcelSheet,
     ExcelRange    = ExcelRange,
+    -- Word
+    WordApp       = WordApp,
+    WordDocument  = WordDocument,
+    WordRange     = WordRange,
+    -- 工具
     columnLetter  = ExcelApp.columnLetter,
     columnNumber  = ExcelApp.columnNumber,
     cellAddr      = ExcelApp.cellAddr,
