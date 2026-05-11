@@ -422,7 +422,7 @@ end
 ---@param format string|nil "xlsx"|"xlsm"|"xls"|"csv"|"pdf"
 function ExcelWorkbook:saveAs(path, format)
     local fmt = format and XlFileFormat[format:lower()] or XlFileFormat.xlsx
-    self._com.SaveAs(path, fmt or XlFileFormat.xlsx)
+    self._com:SaveAs(path, fmt or XlFileFormat.xlsx)
 end
 
 --- 关闭工作簿

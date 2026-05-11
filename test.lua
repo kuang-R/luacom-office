@@ -16,7 +16,7 @@
     PART 2  UTILITY FUNCTIONS    纯函数单元测试，不需要 Excel           [1 step]
     PART 3  ENCODING             UTF-8 ↔ GBK 往返转码测试              [1 step]
     PART 4  EXCEL COM            核心流程集成测试 (创建→读写→格式→退出) [11 steps]
-    PART 5  COVERAGE EXTENSION   覆盖率扩展 (App/Sheet/Range 剩余 API) [13 steps]
+    PART 5  COVERAGE EXTENSION   覆盖率扩展 (App/Sheet/Range 剩余 API + saveAs) [14 steps]
     PART 6  RESOURCE MANAGEMENT  COM 自动资源管理 (__gc/__close/容错)  [5 steps]
 
 ===============================================================================
@@ -626,6 +626,7 @@ end
 --    [25] 清除: clear (保留格式), clearAll (含格式)
 --    [26] 行列插删: insertRows, deleteRows, insertColumns, deleteColumns
 --    [27] 计算: calculation mode, calculate
+--    [28] saveAs: 默认 xlsx + 指定 csv 格式
 -- ============================================================================
 local function part5_coverage(log)
 
@@ -872,6 +873,70 @@ local function part5_coverage(log)
         log:assertion("30+20==30", s:cell(30, 3) == 30, 30, s:cell(30, 3))
         wb:calculation("auto")
         log:pass(id)
+
+        -- ================================================================
+        -- [28] saveAs: 默认 xlsx + 指定 csv 格式，验证文件存在且非空
+        --      使用 os.tmpname() 唯一路径，不加后缀让 Excel 自动处理
+        -- ================================================================
+        id = log:step("saveAs (xlsx default + csv, verify file exists)")
+
+        -- 使用当前目录下的唯一文件名 (绝对路径, 避免 Excel/Lua 工作目录不一致)
+        local function uniquePath(ext)
+            local name = "test_saveas_" .. string.gsub(os.date("%H%M%S") .. "_" .. math.random(10000), "%.", "")
+            -- 优先使用 os.tmpname() 的目录部分, 拼接唯一文件名
+            local tmp = os.tmpname()
+            pcall(function() os.remove(tmp) end)  -- 删除 tmpname 可能创建的空文件
+            local dir = tmp:match("^(.*)[\\/]") or "."
+            return dir .. "\\" .. name .. ext
+        end
+        local tmp_xlsx = uniquePath(".xlsx")
+        local tmp_csv  = uniquePath(".csv")
+        log:data("saveAs path xlsx", tmp_xlsx)
+        log:data("saveAs path csv", tmp_csv)
+        s:cell(1, 1, "saveAs_test")
+
+        -- 默认格式 xlsx
+        local xlsx_ok, xlsx_err = pcall(function() wb:saveAs(tmp_xlsx) end)
+        local xlsx_size = 0
+        local xlsx_exists = false
+        if xlsx_ok then
+            local fh = io.open(tmp_xlsx, "rb")
+            if fh then
+                xlsx_size = fh:seek("end")
+                fh:close()
+                xlsx_exists = xlsx_size > 0
+            end
+        end
+        log:data("saveAs xlsx", (xlsx_ok and ("OK, " .. xlsx_size .. " bytes") or ("FAIL: " .. tostring(xlsx_err))))
+        log:assertion("xlsx file exists & non-empty", xlsx_exists, true, xlsx_exists)
+
+        -- 指定 csv 格式
+        local csv_ok, csv_err = pcall(function() wb:saveAs(tmp_csv, "csv") end)
+        local csv_size = 0
+        local csv_exists = false
+        if csv_ok then
+            local fh = io.open(tmp_csv, "rb")
+            if fh then
+                csv_size = fh:seek("end")
+                fh:close()
+                csv_exists = csv_size > 0
+            end
+        end
+        log:data("saveAs csv", (csv_ok and ("OK, " .. csv_size .. " bytes") or ("FAIL: " .. tostring(csv_err))))
+        log:assertion("csv file exists & non-empty", csv_exists, true, csv_exists)
+
+        -- 清理 (同时尝试 raw 路径以防 Excel 忽略后缀)
+        pcall(function() os.remove(tmp_xlsx) end)
+        pcall(function() os.remove(raw_xlsx) end)
+        pcall(function() os.remove(tmp_csv) end)
+        pcall(function() os.remove(raw_csv) end)
+
+        if xlsx_exists and csv_exists then
+            log:pass(id)
+        else
+            log:fail(id, "file missing or empty")
+            all_ok = false
+        end
     end)
 
     -- 清理
@@ -894,11 +959,11 @@ end
 --  创建独立 Excel 实例, 不影响其他 PART。
 --
 --  步骤:
---    [30] 双重 quit 安全: quit() → quit() 不崩溃
---    [31] 手动 quit 后操作: quit 后尝试方法调用, 应安全返回 nil/error
---    [32] __close 自动清理: 使用 to-be-closed 变量, 离开作用域自动 quit
---    [33] 异常恢复: 在 to-be-closed 作用域内抛异常, __close 应触发清理
---    [34] 多次创建/退出: 反复创建/退出 Excel 实例, 不累积僵尸进程
+--    [29] 双重 quit 安全: quit() → quit() 不崩溃
+--    [30] 手动 quit 后操作: quit 后尝试方法调用, 应安全返回 nil/error
+--    [31] __close 自动清理: 使用 to-be-closed 变量, 离开作用域自动 quit
+--    [32] 异常恢复: 在 to-be-closed 作用域内抛异常, __close 应触发清理
+--    [33] 多次创建/退出: 反复创建/退出 Excel 实例, 不累积僵尸进程
 -- ============================================================================
 local function part6_resource(log)
 
