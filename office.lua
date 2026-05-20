@@ -510,9 +510,14 @@ end
 
 --- 获取或设置单个单元格的值
 ---
+--- **注意**: 此方法返回单元格值或 Sheet，**不返回 Range**。
+--- 如需链式格式化单元格，请用 `range()` 获取 ExcelRange：
+---   s:range("A1"):bold(true):halign("Center")
+---   s:range(1, 1, 1, 1):value("Hello"):bold(true)
+---
 ---```lua
----local v = s:cell(1, 1)          -- 读 A1
----s:cell(2, 3, "Hello")           -- 写 C2
+---local v = s:cell(1, 1)          -- 读 A1 (返回值)
+---s:cell(2, 3, "Hello")           -- 写 C2 (返回 Sheet)
 ---```
 ---
 ---@param r integer 行
